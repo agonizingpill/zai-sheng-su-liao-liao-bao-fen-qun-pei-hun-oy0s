@@ -7,6 +7,7 @@ from .database import Session
 from .models import Blend
 from .quality_models import PelletCheck
 from .production_models import Dryer,DryingRun,PelletPack,BlendShipment,ShipmentPack
+from .returns_models import PackReturn,ReturnPack,ShipmentReturnPack
 from .blending import obj,get,audit,view
 
 def stamp(v):return (v.replace(tzinfo=ZoneInfo('Asia/Shanghai'))if v.tzinfo is None else v).astimezone(timezone.utc)
@@ -14,10 +15,13 @@ def now():return datetime.now(timezone.utc).isoformat()
 def dry_view(s,x):return {**obj(x),'blend_code':s.get(Blend,x.blend_id).code,'dryer_code':s.get(Dryer,x.dryer_id).code}
 def pack_view(s,x):
     p=s.get(PelletCheck,x.check_id)
-    return {**obj(x),'blend_code':s.get(Blend,p.blend_id).code,'certificate_code':p.certificate_code}
+    returned=s.scalar(select(func.coalesce(func.sum(PackReturn.kg),0)).where(PackReturn.pack_id==x.id))
+    return {**obj(x),'blend_code':s.get(Blend,p.blend_id).code,'certificate_code':p.certificate_code,'returned_kg':float(returned)}
 def ship_view(s,x):
     packs=[{**obj(link),'pack_code':s.get(PelletPack,link.pack_id).code}for link in s.scalars(select(ShipmentPack).where(ShipmentPack.shipment_id==x.id).order_by(ShipmentPack.id))]
-    return {**obj(x),'packs':packs,'total_kg':float(sum((Decimal(str(p['pack_snapshot']['kg']))for p in packs),Decimal(0)))}
+    returns=[{**obj(link),'pack_code':s.get(ReturnPack,link.return_pack_id).code}for link in s.scalars(select(ShipmentReturnPack).where(ShipmentReturnPack.shipment_id==x.id).order_by(ShipmentReturnPack.id))]
+    total=sum((Decimal(str(p['pack_snapshot']['kg']))for p in packs),Decimal(0))+sum((Decimal(str(r['pack_snapshot']['kg']))for r in returns),Decimal(0))
+    return {**obj(x),'packs':packs,'return_packs':returns,'total_kg':float(total)}
 def room(s,dryer_id,start,end,exclude=None):
     for x in s.scalars(select(DryingRun).where(DryingRun.dryer_id==dryer_id).with_for_update().execution_options(populate_existing=True)):
         if x.id!=exclude and datetime.fromisoformat(x.starts_at)<end and datetime.fromisoformat(x.ends_at)>start:raise HTTPException(409,'烘干设备在此时段已有作业，不能重叠占用')
@@ -78,11 +82,13 @@ def dispatch(s,id,u):
     sh=get(s,BlendShipment,id,True)
     if sh.state!='loading':raise HTTPException(409,'仅装车中清单可发车，不可重复出库')
     snap=ship_view(s,sh)
-    if not snap['packs']:raise HTTPException(409,'清单没有已封箱成品，不能发车')
+    if not snap['packs'] and not snap['return_packs']:raise HTTPException(409,'清单没有已封箱成品或可售退货箱，不能发车')
     sh.manifest={'code':sh.code,'customer':sh.customer,'packs':snap['packs'],'total_kg':snap['total_kg'],'at':now(),'dispatched_by':u['email']};sh.dispatched_by=u['email'];sh.state='dispatched';audit(s,u,'shipment_dispatched',sh.code);return ship_view(s,sh)
 def receive(s,id,p,u):
     sh=get(s,BlendShipment,id,True)
     if sh.state!='dispatched':raise HTTPException(409,'仅已发车清单可签收，不能重复')
     manifest_kg=Decimal(str(sh.manifest['total_kg']));variance=(p.received_kg-manifest_kg)/manifest_kg*100
     if abs(variance)>Decimal('.5')and len(p.difference_note.strip())<8:raise HTTPException(409,'签收重量与清单偏差超过0.5%，须至少8字差异说明')
-    sh.receipt_snapshot={**p.model_dump(mode='json'),'manifest_kg':float(manifest_kg),'variance_pct':float(variance.quantize(Decimal('.0001'))),'at':now(),'recorded_by':u['email']};sh.state='received';audit(s,u,'shipment_received',sh.code);return ship_view(s,sh)
+    sh.receipt_snapshot={**p.model_dump(mode='json'),'manifest_kg':float(manifest_kg),'variance_pct':float(variance.quantize(Decimal('.0001'))),'at':now(),'recorded_by':u['email']};sh.state='received'
+    for link in s.scalars(select(ShipmentReturnPack).where(ShipmentReturnPack.shipment_id==sh.id)):get(s,ReturnPack,link.return_pack_id,True).state='sold'
+    audit(s,u,'shipment_received',sh.code);return ship_view(s,sh)
